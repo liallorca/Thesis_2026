@@ -1,0 +1,284 @@
+# Pre-processing raw MOLA data 
+
+"""
+mola_to_stl.py
+--------------
+Turns a MOLA GeoTIFF exported from QGIS into a watertight terrain STL for Ansys.
+
+What it does, in order:
+  1. reads the GeoTIFF (one height per MOLA pixel)
+  2. converts pixel positions to metres (east-west spacing shrinks with cos(latitude))
+  3. resamples the central 100 km x 100 km onto a clean 400 m grid
+  4. adds a 10 km buffer on every side: a smooth 5 km taper, then flat ground
+  5. makes it watertight by adding a flat base and four vertical walls
+  6. writes the STL and prints the dimensions you need for the airbox
+
+Run:   python mola_to_stl.py crater_cradle.tif
+Needs: pip install numpy scipy rasterio numpy-stl matplotlib
+"""
+
+import sys
+import numpy as np
+import rasterio
+from scipy.interpolate import RegularGridInterpolator
+from stl import mesh
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# 1. SETTINGS (same for every site)
+# =============================================================================
+FILE = "/Users/cybersynthesis/Desktop/THESIS_2026/QGIS/test_15.tif"
+
+SPACING = 400.0            # grid spacing in metres
+TERRAIN = 100_000.0        # side of the terrain square (100 km)
+BUFFER = 10_000.0          # extra flat ground added on each side (10 km)
+TAPER = 5_000.0            # the first 5 km of the buffer blend smoothly into the terrain
+BASE_DEPTH = 1_000.0       # artificial flat base this far below the lowest terrain point
+
+MARS_RADIUS = 3_396_190.0                      # metres
+METRES_PER_DEGREE = np.pi / 180 * MARS_RADIUS  # 59 275 m per degree
+HALF = TERRAIN / 2
+
+# =============================================================================
+# 2. READ THE GEOTIFF
+# =============================================================================
+with rasterio.open(FILE) as ds:
+    z_mola = ds.read(1).astype(float)                         # heights, one per pixel
+    t = ds.transform
+    col_pos = t.c + (np.arange(ds.width) + 0.5) * t.a        # position of each column
+    row_pos = t.f + (np.arange(ds.height) + 0.5) * t.e       # position of each row
+    in_degrees = ds.crs.is_geographic                         # lat/lon, or metres?
+
+# =============================================================================
+# 3. CONVERT PIXEL POSITIONS TO METRES FROM THE CENTRE OF THE TILE
+# =============================================================================
+if in_degrees:
+    lon_c, lat_c = col_pos.mean(), row_pos.mean()
+    x = (col_pos - lon_c) * METRES_PER_DEGREE * np.cos(np.radians(lat_c))
+    y = (row_pos - lat_c) * METRES_PER_DEGREE
+else:   # equirectangular metres (x = R*lon, y = R*lat): east-west still needs cos(lat)
+    lat_c = np.degrees(row_pos.mean() / MARS_RADIUS)
+    x = (col_pos - col_pos.mean()) * np.cos(np.radians(lat_c))
+    y = row_pos - row_pos.mean()
+
+if y[0] > y[-1]:                   # rows are stored north to south: flip so y increases
+    y = y[::-1]
+    z_mola = z_mola[::-1, :]
+
+pixel = max(x[1] - x[0], y[1] - y[0])
+shortfall = max(x[0] + HALF, HALF - x[-1], y[0] + HALF, HALF - y[-1])
+if shortfall > pixel:
+    sys.exit(f"The export is {shortfall/1000:.1f} km short of 100 km. Export about 105 km from QGIS.")
+
+# =============================================================================
+# 4. RESAMPLE THE CENTRAL 100 km x 100 km ONTO A 400 m GRID
+#    Each new height is the bilinear average of the 4 surrounding MOLA pixels.
+#    fill_value=None lets the outermost half pixel be extended if the crop is exactly 100 km.
+# =============================================================================
+grid = np.arange(-HALF, HALF + SPACING / 2, SPACING)         # -50000 ... +50000, 251 points
+interpolate = RegularGridInterpolator((y, x), z_mola, bounds_error=False, fill_value=None)
+Y, X = np.meshgrid(grid, grid, indexing="ij")
+z_terrain = interpolate(np.stack([Y, X], axis=-1))            # shape (251, 251)
+
+# =============================================================================
+# 5. ADD THE 10 km BUFFER: SMOOTH TAPER, THEN FLAT GROUND
+# =============================================================================
+n_buffer = int(BUFFER / SPACING)                              # 25 extra cells per side
+edge_heights = np.concatenate([z_terrain[0], z_terrain[-1], z_terrain[:, 0], z_terrain[:, -1]])
+z_flat = edge_heights.mean()                                  # height of the flat ground
+
+full = np.arange(-HALF - BUFFER, HALF + BUFFER + SPACING / 2, SPACING)   # -60000 ... +60000
+Y, X = np.meshgrid(full, full, indexing="ij")
+z = np.pad(z_terrain, n_buffer, mode="edge")                  # repeat the edge heights outward
+
+distance_outside = np.hypot(np.maximum(abs(X) - HALF, 0), np.maximum(abs(Y) - HALF, 0))
+weight = 0.5 * (1 + np.cos(np.pi * np.minimum(distance_outside / TAPER, 1)))  # 1 -> 0 over 5 km
+z = weight * z + (1 - weight) * z_flat                        # terrain blends into flat ground
+
+# 5b. SAVE THE HEIGHT IMAGE FOR THE U-NET
+#    z is now the finished terrain: 301 x 301 heights in metres, one every 400 m,
+#    buffer included. Row 0 is the SOUTH edge (y = -60000) and column 0 is the
+#    WEST edge (x = -60000), so the inlet is on the left of the picture.
+#    The .npy keeps the exact heights for the U-Net. The .png is only a picture.
+# =============================================================================
+stem = FILE.rsplit(".", 1)[0]
+np.save(stem + "_grid.npy", z)
+ 
+km = full / 1000
+plt.figure(figsize=(6, 5))
+plt.imshow(z, origin="lower", extent=[km[0], km[-1], km[0], km[-1]], cmap="terrain")
+plt.colorbar(label="MOLA elevation (m)")
+plt.xlabel("x (km)")
+plt.ylabel("y (km)")
+plt.title(stem.rsplit("/", 1)[-1])
+plt.savefig(stem + "_height.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# =============================================================================
+# 6. MAKE IT WATERTIGHT: FLAT BASE + FOUR WALLS
+#    The top surface alone is just a sheet. Adding a base and walls closes it
+#    into a solid block that SpaceClaim can subtract from the airbox.
+# =============================================================================
+z_base = z.min() - BASE_DEPTH
+top = np.stack([X, Y, z], axis=-1)                            # points on the terrain
+bottom = np.stack([X, Y, np.full_like(z, z_base)], axis=-1)   # same points, dropped to the base
+
+
+def two_triangles(a, b, c, d):
+    """Split each four-cornered patch (a, b, c, d anticlockwise seen from outside)
+    into two triangles. Returns an array of triangles, shape (N, 3, 3)."""
+    a, b, c, d = (p.reshape(-1, 3) for p in (a, b, c, d))
+    return np.concatenate([np.stack([a, b, c], axis=1), np.stack([a, c, d], axis=1)])
+
+
+triangles = np.concatenate([
+    two_triangles(top[:-1, :-1], top[:-1, 1:], top[1:, 1:], top[1:, :-1]),             # terrain (faces up)
+    two_triangles(bottom[:-1, :-1], bottom[1:, :-1], bottom[1:, 1:], bottom[:-1, 1:]), # base (faces down)
+    two_triangles(bottom[0, :-1], bottom[0, 1:], top[0, 1:], top[0, :-1]),             # south wall
+    two_triangles(bottom[-1, 1:], bottom[-1, :-1], top[-1, :-1], top[-1, 1:]),         # north wall
+    two_triangles(bottom[1:, 0], bottom[:-1, 0], top[:-1, 0], top[1:, 0]),             # west wall
+    two_triangles(bottom[:-1, -1], bottom[1:, -1], top[1:, -1], top[:-1, -1]),         # east wall
+])
+
+# =============================================================================
+# 7. WRITE THE STL (units: metres)
+# =============================================================================
+out = FILE.rsplit(".", 1)[0] + "_terrain.stl"
+solid = mesh.Mesh(np.zeros(len(triangles), dtype=mesh.Mesh.dtype))
+solid.vectors[:] = triangles
+solid.save(out)
+
+# =============================================================================
+# 8. SUMMARY
+# =============================================================================
+H = z_terrain.max() - z_flat          # height of the highest point above the flat ground
+print(f"""
+Input ................ {FILE}  ({z_mola.shape[1]} x {z_mola.shape[0]} MOLA pixels, {x[1]-x[0]:.0f} m E-W x {y[1]-y[0]:.0f} m N-S)
+Output ............... {out}
+
+Terrain .............. {TERRAIN/1000:.0f} km x {TERRAIN/1000:.0f} km at {SPACING:.0f} m spacing ({len(grid)-1} x {len(grid)-1} cells)
+With buffer .......... {(TERRAIN+2*BUFFER)/1000:.0f} km x {(TERRAIN+2*BUFFER)/1000:.0f} km, x and y from {full[0]:.0f} to {full[-1]:.0f} m
+Highest point ........ {z_terrain.max():.0f} m (MOLA elevation)
+Lowest point ......... {z_terrain.min():.0f} m
+Flat ground level .... {z_flat:.0f} m   (taper: {edge_heights.min():.0f} .. {edge_heights.max():.0f} m at the terrain edge -> flat over {TAPER/1000:.0f} km)
+Artificial base ...... {z_base:.0f} m   ({BASE_DEPTH:.0f} m below the lowest point, closes the solid)
+Triangles ............ {len(triangles)}   (shortest edge {SPACING:.0f} m)
+
+Airbox to draw (metres):
+   x and y ........... {full[0]:.0f} to {full[-1]:.0f}   (same footprint as the terrain)
+   bottom ............ {z_base + 500:.0f}   (inside the base, below the lowest point)
+   top ............... {z_flat + 5*H:.0f}   (= flat ground + 5 x H, H = {H:.0f} m)
+""")
+
+
+
+
+
+
+
+"""
+make_airbox.py
+--------------
+Makes the airbox STL for a terrain STL made by mola_to_stl.py.
+
+The box is read straight from the terrain file, so it always matches:
+  - same x and y footprint as the terrain (-60 km to +60 km)
+  - bottom 500 m above the terrain's artificial base (so it is below all terrain)
+  - top at BOX_TOP (you choose)
+
+In SpaceClaim: import both STLs in metres, convert both to solids,
+Combine -> subtract the terrain from the airbox. What is left is the fluid body.
+"""
+
+import numpy as np
+from stl import mesh
+
+# =============================================================================
+# 1. SETTINGS
+# =============================================================================
+TERRAIN_STL = "/Users/cybersynthesis/Desktop/THESIS_2026/STL_Files/cyclone_valley_full_terrain.stl"   # the terrain file
+BOX_TOP = 20_000.0          # top of the airbox in metres (MOLA elevation)
+BOTTOM_ABOVE_BASE = 500.0   # box bottom sits this far above the terrain's artificial base
+
+# =============================================================================
+# 2. READ THE TERRAIN STL TO GET ITS EXACT DIMENSIONS
+# =============================================================================
+terrain = mesh.Mesh.from_file(TERRAIN_STL)
+
+x_min, y_min, z_base = terrain.min_        # lowest corner of the terrain block
+x_max, y_max, z_top = terrain.max_         # highest corner (z_top = highest terrain point)
+
+z_bottom = z_base + BOTTOM_ABOVE_BASE      # box bottom: inside the base, below all terrain
+
+# =============================================================================
+# 3. THE 8 CORNERS OF THE BOX
+# =============================================================================
+corners = np.array([
+    [x_min, y_min, z_bottom],   # 0  bottom, south-west
+    [x_max, y_min, z_bottom],   # 1  bottom, south-east
+    [x_max, y_max, z_bottom],   # 2  bottom, north-east
+    [x_min, y_max, z_bottom],   # 3  bottom, north-west
+    [x_min, y_min, BOX_TOP],    # 4  top, south-west
+    [x_max, y_min, BOX_TOP],    # 5  top, south-east
+    [x_max, y_max, BOX_TOP],    # 6  top, north-east
+    [x_min, y_max, BOX_TOP],    # 7  top, north-west
+])
+
+# =============================================================================
+# 4. THE 12 TRIANGLES (2 per face, corners anticlockwise seen from outside)
+# =============================================================================
+faces = [
+    (0, 3, 2), (0, 2, 1),   # bottom
+    (4, 5, 6), (4, 6, 7),   # top
+    (0, 1, 5), (0, 5, 4),   # south wall
+    (2, 3, 7), (2, 7, 6),   # north wall
+    (3, 0, 4), (3, 4, 7),   # west wall
+    (1, 2, 6), (1, 6, 5),   # east wall
+]
+
+# =============================================================================
+# 5. WRITE THE STL (units: metres)
+# =============================================================================
+out = TERRAIN_STL.replace("_terrain.stl", "_airbox.stl")
+box = mesh.Mesh(np.zeros(len(faces), dtype=mesh.Mesh.dtype))
+box.vectors[:] = corners[np.array(faces)]
+box.save(out)
+
+# =============================================================================
+# 6. SUMMARY
+# =============================================================================
+print(f"""
+Terrain .............. {TERRAIN_STL}
+Airbox ............... {out}
+
+Airbox dimensions (metres):
+   x ................. {x_min:.0f} to {x_max:.0f}   ({(x_max-x_min)/1000:.0f} km, same as terrain)
+   y ................. {y_min:.0f} to {y_max:.0f}   ({(y_max-y_min)/1000:.0f} km, same as terrain)
+   bottom ............ {z_bottom:.0f}   ({BOTTOM_ABOVE_BASE:.0f} m above the terrain base at {z_base:.0f})
+   top ............... {BOX_TOP:.0f}   ({BOX_TOP - z_top:.0f} m above the highest terrain point at {z_top:.0f})
+""")
+
+
+
+
+
+# Max height of the terrain (for the Ansys worksheet)
+# Reads the terrain STL and prints its highest and lowest point.
+# The flat base under the terrain is left out.
+import numpy as np
+from stl import mesh
+
+STL_FILE =  "/Users/cybersynthesis/Desktop/THESIS_2026/STL_Files/validation_test_site.stl"
+z = mesh.Mesh.from_file(STL_FILE).vectors[:, :, 2]
+z_terrain = z[z > z.min()]          # leave out the flat base
+
+print("Terrain file ...", STL_FILE.rsplit("/", 1)[-1])
+print("Highest point ..", round(z_terrain.max()), "m")
+print("Lowest point ...", round(z_terrain.min()), "m")
+
+
+
+
+
+
+
